@@ -3,6 +3,7 @@ import db, { ts, now, DEFAULT_WEIGHTS, DEFAULT_KEYWORD_CAP } from './db.js'
 import {
   router as crisisRouter, bindCrisisCore, auditPassive, getCrisisState
 } from './crisis.js'
+import { router as scheduleRouter, getScheduleState } from './schedule.js'
 
 const app = express()
 app.use(express.json())
@@ -450,7 +451,8 @@ app.get('/api/state', (req, res) => {
     positions, candidates, applications: pipelines, interviews, offers, offerLogs, channels, matches,
     strategyVersions, recalcJobs, recalcItems, users, approvals, notifications,
     defaultStrategy: { weights: { ...DEFAULT_WEIGHTS }, keywordCap: DEFAULT_KEYWORD_CAP },
-    ...getCrisisState()
+    ...getCrisisState(),
+    ...getScheduleState()
   })
 })
 
@@ -1488,6 +1490,17 @@ function migrateHistory() {
       }
     })
 
+    // 补录事件落库后回填当前阶段快照/进入时间（可能来自补录事件；正式事件由 db.js 兼容段优先处理）
+    db.prepare(`UPDATE applications SET stage_snapshot=(
+                  SELECT e.score_snapshot FROM application_events e
+                  WHERE e.application_id=applications.id AND e.stage=applications.stage
+                  ORDER BY e.id DESC LIMIT 1),
+                entered_at=(
+                  SELECT e.event_at FROM application_events e
+                  WHERE e.application_id=applications.id AND e.stage=applications.stage
+                  ORDER BY e.id DESC LIMIT 1)
+                WHERE stage_snapshot=''`).run()
+
     if (jobId) console.log(`[HR] startup recalc job #${jobId} refreshed ${pairRows.length} pairs`)
     if (appsNeedBackfill.length) console.log(`[HR] backfilled trace events for ${appsNeedBackfill.length} applications`)
   })
@@ -1497,6 +1510,8 @@ migrateHistory()
 // 挂载跨角色危机处置审计模块（路由 + 哈希链 + 责任回写），并注入主流程回退执行器
 bindCrisisCore({ rollbackForIncident })
 app.use('/api/crisis', crisisRouter)
+// 候选人↔面试官双向预约沟通（可用时段/双向确认改期/提醒/缺席处理）
+app.use('/api/schedule', scheduleRouter)
 
 // 统一业务错误出口：ApiError 携带状态码与错误码，其余错误按 500 返回
 // eslint-disable-next-line no-unused-vars

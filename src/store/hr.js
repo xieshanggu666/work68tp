@@ -49,6 +49,9 @@ export const useHrStore = defineStore('hr', {
     crisisTickets: s => s.data?.crisisTickets || [],
     crisisReports: s => s.data?.crisisReports || [],
     crisisVerification: s => s.data?.crisisVerification || {},
+    // 候选人↔面试官双向预约
+    scheduleSlots: s => s.data?.slots || [],
+    appointments: s => s.data?.appointments || [],
     defaultStrategy: s => s.data?.defaultStrategy || { weights: { skill: 0.4, year: 0.2, salary: 0.15, edu: 0.15, city: 0.1 }, keywordCap: 5 },
     openPositions: s => (s.data?.positions || []).filter(p => p.status === 'open'),
     isBusy: s => key => !!s.pending[key],
@@ -67,6 +70,21 @@ export const useHrStore = defineStore('hr', {
       return this.approvals.filter(t =>
         t.status === 'pending' && t.chain[t.current_step]?.role === this.myRole
       ).length
+    },
+    // 预约协商待办：面试官=待本人确认/改期确认的预约；招聘负责人=待候选人确认 + 系统初判缺席待裁定
+    scheduleTodoCount() {
+      const my = this.currentUser
+      return this.appointments.filter(a => {
+        if (my?.role === 'interviewer') {
+          return (a.status === 'negotiating' || a.status === 'rescheduling') &&
+            a.interviewer_id === my.id && !a.int_confirmed
+        }
+        if (my?.role === 'recruiter') {
+          return ((a.status === 'negotiating' || a.status === 'rescheduling') && !a.cand_confirmed) ||
+            (a.status === 'no_show' && a.checkin_flagged)
+        }
+        return false
+      }).length
     }
   },
   actions: {
@@ -278,6 +296,73 @@ export const useHrStore = defineStore('hr', {
         return r
       } catch (e) { this.notify('error', e.message); return null }
     },
-    exportIncidentUrl(id) { return `/api/crisis/incidents/${id}/export` }
+    exportIncidentUrl(id) { return `/api/crisis/incidents/${id}/export` },
+    // ---------------- 候选人↔面试官双向预约 ----------------
+    addSlot(p) {
+      return this.runBusy(`slot-add:${p.owner_type}:${p.owner_id}:${p.start_at}`, () =>
+        this.api('POST', '/schedule/slots', p, { success: '可用时段已添加' }))
+    },
+    bulkSlots(p) {
+      return this.runBusy(`slot-bulk:${p.owner_type}:${p.owner_id}:${p.date}`, () =>
+        this.api('POST', '/schedule/slots/bulk', p, { success: '可用时段已批量生成' }))
+    },
+    delSlot(id) {
+      return this.runBusy(`slot-del:${id}`, () =>
+        this.api('DELETE', `/schedule/slots/${id}`, {}, { success: '时段已删除' }))
+    },
+    createAppointment(p) {
+      return this.runBusy(`appt-new:${p.application_id}:${p.round}`, () =>
+        this.api('POST', '/schedule/appointments', p, { success: '预约已发起' }))
+    },
+    confirmAppointment(id, party) {
+      return this.runBusy(`appt-confirm:${id}:${party || ''}`, () =>
+        this.api('POST', `/schedule/appointments/${id}/confirm`, party ? { party } : {}, { success: '已确认该时间' }))
+    },
+    proposeAppointment(id, p) {
+      return this.runBusy(`appt-propose:${id}`, () =>
+        this.api('POST', `/schedule/appointments/${id}/propose`, p, p.reason ? { success: '改期申请已发起，待对方确认' } : { success: '新时间已提议' }))
+    },
+    rejectReschedule(id, note) {
+      return this.runBusy(`appt-rejectrs:${id}`, () =>
+        this.api('POST', `/schedule/appointments/${id}/reject-reschedule`, { note }, { success: '已拒绝改期，维持原时间' }))
+    },
+    declineAppointment(id, reason, party) {
+      return this.runBusy(`appt-decline:${id}`, () =>
+        this.api('POST', `/schedule/appointments/${id}/decline`, { reason, party }, { success: '已婉拒本轮预约' }))
+    },
+    cancelAppointment(id, reason) {
+      return this.runBusy(`appt-cancel:${id}`, () =>
+        this.api('POST', `/schedule/appointments/${id}/cancel`, { reason }, { success: '预约已取消' }))
+    },
+    resumeAppointment(id, p) {
+      return this.runBusy(`appt-resume:${id}`, () =>
+        this.api('POST', `/schedule/appointments/${id}/resume`, p, { success: '已重新发起预约协商' }))
+    },
+    rebookAppointment(id, p) {
+      return this.runBusy(`appt-rebook:${id}`, () =>
+        this.api('POST', `/schedule/appointments/${id}/rebook`, p, { success: '缺席后已重新约期，待对方确认' }))
+    },
+    completeAppointment(id) {
+      return this.runBusy(`appt-done:${id}`, () =>
+        this.api('POST', `/schedule/appointments/${id}/complete`, {}, { success: '已标记面试完成' }))
+    },
+    noShowAppointment(id, result, note) {
+      return this.runBusy(`appt-noshow:${id}`, () =>
+        this.api('POST', `/schedule/appointments/${id}/noshow`, { result, note }, { success: '缺席裁定已记录' }))
+    },
+    remindAppointment(id) {
+      return this.runBusy(`appt-remind:${id}`, () =>
+        this.api('POST', `/schedule/appointments/${id}/remind`, {}, { success: '会前提醒已发送给双方' }))
+    },
+    async sweepSchedule() {
+      try {
+        const r = await j('GET', '/schedule/sweep')
+        if ((r.reminded24 || r.reminded1 || r.noShow)) {
+          this.notify('success', `提醒已发送：24小时 ${r.reminded24} 条 / 1小时 ${r.reminded1} 条${r.noShow ? `；新初判缺席 ${r.noShow} 条` : ''}`)
+        }
+        await this.refresh()
+        return r
+      } catch (e) { this.notify('error', e.message); return null }
+    }
   }
 })

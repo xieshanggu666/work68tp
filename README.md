@@ -36,6 +36,7 @@ hr/
         ├── MatchView.vue        # 智能匹配
         ├── PipelineView.vue     # 招聘流程看板
         ├── InterviewView.vue    # 面试管理
+        ├── ScheduleView.vue     # 预约沟通（可用时段/双向确认改期/提醒/缺席）
         ├── OfferView.vue        # Offer 管理
         ├── ApprovalView.vue     # 审批中心（待我审批/我发起的/全部记录）
         ├── CrisisView.vue       # 危机处置审计（事件/哈希链/授权/工单/复盘）
@@ -77,6 +78,20 @@ npm run dev     # 同时启动后端(4160) 与 前端 Vite
 | `crisis_grants` | 危机期间的临时跨角色授权（授予/收回各上一条链，结案自动收回） |
 | `crisis_tickets` | 危机处置工单（责任到人，创建/改派/流转均上链并回写通知责任人） |
 | `crisis_reports` | 危机复盘报告（草稿可改，定稿强制校验哈希链并固化从审计链汇总的责任矩阵；定稿后不可改） |
+| `schedule_slots` | 面试官/候选人**可用时段池**（`owner_type` 归属方、`source=self/recruiter` 本人维护或 HR 代录、`open/used` 状态与占用预约联动） |
+| `appointments` | 双向预约单（协商状态机 `negotiating/confirmed/rescheduling/declined/completed/no_show/cancelled` + 双方确认位 `cand_confirmed/int_confirmed` + 改期提议 `pending_*` + 提醒幂等位） |
+| `appointment_messages` | 预约沟通留痕（发起/确认/改期/拒绝改期/婉拒/取消/提醒/缺席裁定/重约，只追加，形成协商时间线） |
+
+## 候选人↔面试官双向预约沟通（📅 预约沟通）
+
+侧边栏「📅 预约沟通」进入，覆盖**可用时段、确认改期、提醒、缺席处理**完整闭环。候选人侧操作由招聘负责人电话/短信确认后代为执行（候选人通知投递招聘负责人角色），面试官侧本人操作；用人经理不参与预约协商。
+
+- **可用时段**：面试官维护本人时段（`self`），招聘负责人可批量勾选工作日时刻代录任意一方时段（候选人侧为 `recruiter` 来源）；发起预约时自动计算**双方 open 时段重叠**并一键填充。确认成立的预约自动占用对应时段（`open→used`），取消/改期/缺席释放。
+- **双向确认**：发起时双方确认位可预置（HR 默认已与候选人确认；面试官发起默认面试官确认）；两边都为 1 才从「待确认」落定为「已确认」并占用时段、同步 `interviews` 表时间。面试官时段重叠或同一候选人同轮次重复预约返回 409。
+- **确认改期**：已确认预约任一方可发起改期（**原因必填**），进入「改期协商中」：原时间保留、新提议放入 `pending_*` 并重置双方确认位，双方再次确认后新时间生效；任一方可**拒绝改期**，预约自动回到已确认并维持原时间。协商中也可「婉拒本轮」，之后可在原单上「重新协商」（历史时间线保留）。
+- **提醒**：页面顶部「同步提醒/缺席扫描」（`GET /api/schedule/sweep`，幂等）自动扫描——开始前 **24 小时**与 **1 小时**分别向面试官、招聘负责人（转达候选人）投递提醒，时间线写入 `remind24h/remind1h`；也可在详情里**立即手动提醒**。
+- **缺席处理**：结束 **15 分钟宽限期**后仍处已确认（未标记完成）的预约，sweep **系统初判候选人缺席**（`auto_noshow`，可改判）；招聘负责人可裁定/改判为候选人缺席、面试官缺席、双方缺席，缺席后支持**保留缺席记录重新约期**（`rebook`，对方确认后成立）。
+- **API**：`POST /api/schedule/slots|slots/bulk`、`DELETE …/slots/:id`、`POST /api/schedule/appointments`、`…/:id/confirm|propose|reject-reschedule|decline|cancel|resume|rebook|complete|noshow|remind`、`GET /api/schedule/sweep`；预约通知（`sched_*`）点击铃铛直达预约沟通页，导航红点显示待当前身份处理的协商数。
 
 ## 角色权限与审批链
 

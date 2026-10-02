@@ -355,6 +355,75 @@ CREATE TABLE IF NOT EXISTS crisis_reports (
   updated_at TEXT NOT NULL DEFAULT ''
 );
 
+-- ---------------- 候选人↔面试官双向预约沟通模块 ----------------
+-- 可用时段池：面试官维护本人时段（self），候选人时段由招聘负责人代录（recruiter，模拟电话/短信确认结果）
+CREATE TABLE IF NOT EXISTS schedule_slots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_type TEXT NOT NULL,             -- interviewer/candidate
+  owner_id TEXT NOT NULL,               -- interviewer=users.id；candidate=candidates.id
+  start_at TEXT NOT NULL,               -- ISO 时间（UTC，带 Z，字典序即可比较先后）
+  end_at TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'self',  -- self 本人维护 / recruiter 招聘负责人代录
+  status TEXT NOT NULL DEFAULT 'open',  -- open 空闲 / used 已被确认预约占用
+  appointment_id INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT '',
+  created_by TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_slots_owner ON schedule_slots(owner_type, owner_id, start_at);
+CREATE INDEX IF NOT EXISTS idx_slots_appt ON schedule_slots(appointment_id);
+
+-- 预约单：双向协商状态机。正式时间（start_at）仅在双方都确认 pending 提议后落定；
+-- 改期期间原正式时间保留，新提议放在 pending_* 字段，拒绝改期可回退原安排
+CREATE TABLE IF NOT EXISTS appointments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  application_id INTEGER NOT NULL,
+  round TEXT NOT NULL DEFAULT '初试',
+  interviewer_id TEXT NOT NULL DEFAULT '',
+  interviewer_name TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'negotiating', -- negotiating/confirmed/rescheduling/declined/completed/no_show/cancelled
+  format TEXT NOT NULL DEFAULT '线上',        -- 线上/线下
+  location TEXT NOT NULL DEFAULT '',
+  start_at TEXT NOT NULL DEFAULT '',          -- 已确认正式时间（ISO）
+  end_at TEXT NOT NULL DEFAULT '',
+  pending_start TEXT NOT NULL DEFAULT '',     -- 待双方确认的提议时间（改期/新提）
+  pending_end TEXT NOT NULL DEFAULT '',
+  pending_format TEXT NOT NULL DEFAULT '',
+  pending_location TEXT NOT NULL DEFAULT '',
+  pending_by_party TEXT NOT NULL DEFAULT '',  -- 提议方 candidate/interviewer/recruiter
+  cand_confirmed INTEGER NOT NULL DEFAULT 0,  -- 候选人对「当前提议/正式时间」的确认位
+  int_confirmed INTEGER NOT NULL DEFAULT 0,   -- 面试官对「当前提议/正式时间」的确认位
+  reminded_24h INTEGER NOT NULL DEFAULT 0,    -- 24 小时提醒已发
+  reminded_1h INTEGER NOT NULL DEFAULT 0,     -- 1 小时提醒已发
+  checkin_flagged INTEGER NOT NULL DEFAULT 0, -- 结束后宽限期过仍未签到，系统已初判缺席
+  final_result TEXT NOT NULL DEFAULT '',      -- completed/candidate_no_show/interviewer_no_show/both_no_show/cancelled
+  note TEXT NOT NULL DEFAULT '',
+  created_by TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT '',
+  confirmed_at TEXT NOT NULL DEFAULT '',
+  completed_at TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT '',
+  version INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_appts_app ON appointments(application_id, id);
+CREATE INDEX IF NOT EXISTS idx_appts_status ON appointments(status, start_at);
+CREATE INDEX IF NOT EXISTS idx_appts_interviewer ON appointments(interviewer_id, status);
+
+-- 预约沟通留痕：提议/确认/改期/拒绝/提醒/缺席裁定只追加不改写，形成双向协商时间线
+CREATE TABLE IF NOT EXISTS appointment_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  appointment_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,                    -- create/propose/confirm/decline/reject_reschedule/cancel/resume/rebook/complete/noshow/auto_noshow/remind24h/remind1h/remind/system
+  party TEXT NOT NULL DEFAULT 'system',  -- candidate/interviewer/recruiter/system
+  actor_id TEXT NOT NULL DEFAULT '',
+  actor_name TEXT NOT NULL DEFAULT '',
+  start_at TEXT NOT NULL DEFAULT '',
+  end_at TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_appt_msgs_appt ON appointment_messages(appointment_id, id);
+
 -- 不可篡改兜底：危机审计链拒绝 UPDATE / DELETE（应用层哈希校验 + 数据库触发器双重保护）
 CREATE TRIGGER IF NOT EXISTS trg_crisis_entries_no_update
 BEFORE UPDATE ON crisis_audit_entries
@@ -406,15 +475,15 @@ db.prepare(`UPDATE application_events SET backfilled=1
 db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_app_events_live_once ON application_events(application_id, stage) WHERE backfilled=0')
 db.exec('CREATE INDEX IF NOT EXISTS idx_app_events_once ON application_events(application_id, stage, event_type)')
 
-// 旧数据补齐：当前阶段快照取自该阶段正式事件；面试结论沿用已录入的 result
-db.prepare(`UPDATE applications SET stage_snapshot=(
+// 旧数据补齐：当前阶段快照取自该阶段正式事件（无正式事件时保持空串，由启动迁移按补录事件回填）
+db.prepare(`UPDATE applications SET stage_snapshot=COALESCE((
                 SELECT e.score_snapshot FROM application_events e
                 WHERE e.application_id=applications.id AND e.stage=applications.stage AND e.backfilled=0
-                ORDER BY e.id DESC LIMIT 1),
-              entered_at=(
+                ORDER BY e.id DESC LIMIT 1),''),
+              entered_at=COALESCE((
                 SELECT e.event_at FROM application_events e
                 WHERE e.application_id=applications.id AND e.stage=applications.stage AND e.backfilled=0
-                ORDER BY e.id DESC LIMIT 1)
+                ORDER BY e.id DESC LIMIT 1),'')
             WHERE stage_snapshot=''`).run()
 db.prepare("UPDATE interviews SET conclusion=result WHERE conclusion='pending' AND result!='pending'").run()
 db.prepare(`UPDATE applications SET reject_from=(
@@ -492,6 +561,83 @@ function seedUsers() {
   ].forEach(u => iU.run(...u))
 }
 seedUsers()
+
+// ---------------- 预约模块演示数据（仅空表时播种，复用既有应聘与面试官） ----------------
+// 生成今天起 offset 天的 ISO 时间（HH:MM 本地时刻），保证演示时段始终在当前时间前后可交互
+function demoISO(offsetDays, hh, mm = 0) {
+  const d = new Date()
+  d.setDate(d.getDate() + offsetDays)
+  d.setHours(hh, mm, 0, 0)
+  return d.toISOString()
+}
+
+function seedSchedule() {
+  const slotCount = db.prepare('SELECT COUNT(*) c FROM schedule_slots').get().c
+  if (slotCount > 0) return
+  const interviewer = db.prepare("SELECT id FROM users WHERE role='interviewer' ORDER BY id LIMIT 1").get()
+  if (!interviewer) return
+
+  // 全新库在播种阶段尚无应聘记录（应聘一般由 API 创建）；这里补两条演示应聘，
+  // 服务端启动时的 migrateHistory 会统一回填匹配快照与阶段事件（标记补录）
+  const appCount = db.prepare('SELECT COUNT(*) c FROM applications').get().c
+  let demoAppIds = db.prepare(`SELECT a.id, a.candidate_id FROM applications a
+                               WHERE a.stage IN ('screening','interview') ORDER BY a.id LIMIT 2`).all()
+  if (!demoAppIds.length && appCount === 0) {
+    const pairs = [
+      { pid: 1, cid: 1, stage: 'interview' }, // 林小雨 → 前端
+      { pid: 2, cid: 3, stage: 'screening' }  // 王浩然 → 后端
+    ]
+    pairs.forEach(({ pid, cid, stage }) => {
+      db.prepare(`INSERT INTO applications(position_id,candidate_id,stage,updated,recruiter,version)
+                  VALUES(?,?,?,?, 'HR-Sandy',1)`).run(pid, cid, stage, ts())
+    })
+    demoAppIds = db.prepare(`SELECT a.id, a.candidate_id FROM applications a
+                             WHERE a.stage IN ('screening','interview') ORDER BY a.id LIMIT 2`).all()
+  }
+
+  const iSlot = db.prepare(`INSERT INTO schedule_slots(owner_type,owner_id,start_at,end_at,source,status,note,created_by,created_at)
+                            VALUES(?,?,?,?,?,'open',?,?,?)`)
+  const iCSlot = db.prepare(`INSERT INTO schedule_slots(owner_type,owner_id,start_at,end_at,source,status,note,created_by,created_at)
+                             VALUES(?,?,?,?,?,?,?,?,?)`)
+  // 面试官未来一周的可用时段
+  ;[
+    [1, 10, 11], [1, 14, 15], [2, 10, 11], [2, 15, 16],
+    [3, 11, 12], [4, 14, 15], [5, 10, 11], [7, 14, 15]
+  ].forEach(([off, s, e]) => {
+    iSlot.run('interviewer', interviewer.id, demoISO(off, s), demoISO(off, e),
+      'self', '', interviewer.id, ts())
+  })
+  // 给前两位在途候选人代录可用时段（招聘负责人电话确认）
+  demoAppIds.forEach((row, idx) => {
+    const off = idx === 0 ? 1 : 2
+    iCSlot.run('candidate', String(row.candidate_id), demoISO(off, 10), demoISO(off, 11),
+      'recruiter', 'open', '电话确认可参加', 'u-sandy', ts())
+    iCSlot.run('candidate', String(row.candidate_id), demoISO(off + 1, 15), demoISO(off + 1, 16),
+      'recruiter', 'open', '候选人偏好下午', 'u-sandy', ts())
+  })
+
+  // 一条「待双向确认」的初试预约：面试官已确认，等待候选人（招聘负责人代为）确认
+  const appRow = demoAppIds[0]
+  if (appRow) {
+    const start = demoISO(1, 10), end = demoISO(1, 11)
+    const stamp = ts()
+    // 一条「待双向确认」的初试预约：面试官已确认，等待候选人（招聘负责人代为）确认
+    db.prepare(`INSERT INTO appointments
+      (application_id,round,interviewer_id,interviewer_name,status,format,location,start_at,end_at,
+       cand_confirmed,int_confirmed,reminded_24h,reminded_1h,created_by,created_at,updated_at,version)
+      VALUES(?,?,?,?,?,?,?,?,?,0,1,0,0,?,?,?,1)`)
+      .run(appRow.id, '初试', interviewer.id, '李工', 'negotiating', '线上', '腾讯会议 880-2166',
+        start, end, 'u-sandy', stamp, stamp)
+    const apptId = Number(db.prepare('SELECT last_insert_rowid() id').get().id)
+    const iMsg = db.prepare(`INSERT INTO appointment_messages(appointment_id,kind,party,actor_id,actor_name,start_at,end_at,content,created_at)
+                             VALUES(?,?,?,?,?,?,?,?,?)`)
+    iMsg.run(apptId, 'create', 'recruiter', 'u-sandy', 'Sandy 陈', start, end,
+      '已与面试官初排该时段，请候选人确认是否可参加', stamp)
+    iMsg.run(apptId, 'confirm', 'interviewer', interviewer.id, '李工', start, end,
+      '面试官已确认该时段', stamp)
+  }
+}
+seedSchedule()
 
 export default db
 export { now, ts, DEFAULT_WEIGHTS, DEFAULT_KEYWORD_CAP }

@@ -7,6 +7,7 @@ import CandidatesView from '@/components/CandidatesView.vue'
 import MatchView from '@/components/MatchView.vue'
 import PipelineView from '@/components/PipelineView.vue'
 import InterviewView from '@/components/InterviewView.vue'
+import ScheduleView from '@/components/ScheduleView.vue'
 import OfferView from '@/components/OfferView.vue'
 import ApprovalView from '@/components/ApprovalView.vue'
 import ReportsView from '@/components/ReportsView.vue'
@@ -23,6 +24,7 @@ const navs = [
   { k: 'match', icon: '🎯', label: '智能匹配' },
   { k: 'pipeline', icon: '🔄', label: '招聘流程' },
   { k: 'interview', icon: '💬', label: '面试管理' },
+  { k: 'schedule', icon: '📅', label: '预约沟通' },
   { k: 'offer', icon: '📄', label: 'Offer 管理' },
   { k: 'approval', icon: '✅', label: '审批中心' },
   { k: 'crisis', icon: '🛡️', label: '危机审计' },
@@ -36,7 +38,12 @@ const notifyIcon = {
   crisis_declared: '🚨', crisis_state: '⚡', crisis_commander: '🔀',
   crisis_grant: '🔑', crisis_grant_log: '🔑', crisis_grant_revoked: '🔒',
   crisis_rollback: '⏪', crisis_ticket: '🎫', crisis_ticket_assign: '🎫', crisis_ticket_update: '🎫',
-  crisis_report: '📝', crisis_closed: '🧾'
+  crisis_report: '📝', crisis_closed: '🧾',
+  sched_proposed: '📨', sched_partial: '✅', sched_confirmed: '📅',
+  sched_reschedule_request: '🔁', sched_reschedule_rejected: '↩️',
+  sched_declined: '🚫', sched_cancelled: '❌', sched_completed: '🎉',
+  sched_noshow: '⚠️', sched_rebooked: '🔄',
+  sched_remind_24h: '⏰', sched_remind_1h: '🔔', sched_remind: '📣'
 }
 
 function onSwitchUser(e) {
@@ -50,10 +57,12 @@ function toggleNotify() {
 function readAll() {
   store.markNotificationsRead()
 }
-// 点击通知跳转到对应中心并关闭面板：危机类 → 危机审计，其余 → 审批中心
+// 点击通知跳转到对应中心并关闭面板：危机类 → 危机审计，预约类 → 预约沟通，其余 → 审批中心
 function openNotify(n) {
   showNotify.value = false
-  view.value = String(n?.type || '').startsWith('crisis_') ? 'crisis' : 'approval'
+  if (String(n?.type || '').startsWith('crisis_')) view.value = 'crisis'
+  else if (String(n?.type || '').startsWith('sched_')) view.value = 'schedule'
+  else view.value = 'approval'
 }
 
 onMounted(store.refresh)
@@ -72,6 +81,9 @@ onMounted(store.refresh)
             <em v-if="n.k === 'approval' && store.todoCount" class="nav-badge">{{ store.todoCount }}</em>
             <em v-else-if="n.k === 'crisis' && store.crisisIncidents.filter(i => i.status !== 'closed').length" class="nav-badge crisis-badge">
               {{ store.crisisIncidents.filter(i => i.status !== 'closed').length }}
+            </em>
+            <em v-else-if="n.k === 'schedule' && store.scheduleTodoCount" class="nav-badge sched-badge">
+              {{ store.scheduleTodoCount }}
             </em>
           </button>
       </nav>
@@ -130,6 +142,7 @@ onMounted(store.refresh)
         <MatchView v-else-if="view === 'match'" />
         <PipelineView v-else-if="view === 'pipeline'" />
         <InterviewView v-else-if="view === 'interview'" />
+        <ScheduleView v-else-if="view === 'schedule'" />
         <OfferView v-else-if="view === 'offer'" />
         <ApprovalView v-else-if="view === 'approval'" />
         <CrisisView v-else-if="view === 'crisis'" />
@@ -167,6 +180,7 @@ main { flex: 1; min-width: 0; }
 .pill b { color: var(--text); }
 .nav-badge { margin-left: auto; font-style: normal; font-size: 10px; min-width: 17px; height: 17px; border-radius: 9px; background: var(--red); color: #fff; display: inline-flex; align-items: center; justify-content: center; padding: 0 4px; }
 .nav-badge.crisis-badge { background: var(--purple); }
+.nav-badge.sched-badge { background: var(--accent2); color: #1a1400; }
 .idzone { display: flex; align-items: center; gap: 10px; }
 .idchip { display: flex; align-items: center; gap: 6px; background: var(--panel); border: 1px solid var(--border); border-radius: 20px; padding: 4px 6px 4px 12px; font-size: 13px; }
 .idchip select { border: none; background: transparent; padding: 3px 4px; font-size: 13px; }
