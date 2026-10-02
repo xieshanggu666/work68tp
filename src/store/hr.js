@@ -21,6 +21,7 @@ export const useHrStore = defineStore('hr', {
   state: () => ({
     data: null,
     loaded: false,
+    nav: 'overview', // 跨页面导航信号（面试页 → 预约页等），App.vue watch 后切换视图
     userId: currentUserId,
     // 全局轻提示：服务端 4xx 约束（重复操作/状态冲突/乐观锁）统一在此提示，保证各页面口径一致
     toast: null,
@@ -49,6 +50,9 @@ export const useHrStore = defineStore('hr', {
     crisisTickets: s => s.data?.crisisTickets || [],
     crisisReports: s => s.data?.crisisReports || [],
     crisisVerification: s => s.data?.crisisVerification || {},
+    // 候选人↔面试官双向预约
+    scheduleSlots: s => s.data?.scheduleSlots || [],
+    appointments: s => s.data?.appointments || [],
     defaultStrategy: s => s.data?.defaultStrategy || { weights: { skill: 0.4, year: 0.2, salary: 0.15, edu: 0.15, city: 0.1 }, keywordCap: 5 },
     openPositions: s => (s.data?.positions || []).filter(p => p.status === 'open'),
     isBusy: s => key => !!s.pending[key],
@@ -112,6 +116,9 @@ export const useHrStore = defineStore('hr', {
     async matchPos(pid) {
       try { return await j('GET', `/match/pos/${pid}`) } catch (e) { this.notify('error', e.message); return null }
     },
+    async scheduleOverlap(appId, userId, days = 14) {
+      try { return await j('GET', `/schedule/overlap/${appId}/${userId}?days=${days}`) } catch (e) { this.notify('error', e.message); return null }
+    },
     async matchCand(cid) {
       try { return await j('GET', `/match/cand/${cid}`) } catch (e) { this.notify('error', e.message); return null }
     },
@@ -173,6 +180,7 @@ export const useHrStore = defineStore('hr', {
       currentUserId = id
       localStorage.setItem('hr-user-id', id)
     },
+    goNav(view) { this.nav = view },
     // 提交审批申请（候选人推进/面试结论/Offer 发放）
     submitApproval(payload) {
       return this.runBusy(`appr-new:${payload.type}:${payload.application_id}`, () =>
@@ -278,6 +286,41 @@ export const useHrStore = defineStore('hr', {
         return r
       } catch (e) { this.notify('error', e.message); return null }
     },
-    exportIncidentUrl(id) { return `/api/crisis/incidents/${id}/export` }
+    exportIncidentUrl(id) { return `/api/crisis/incidents/${id}/export` },
+    // ---------------- 候选人↔面试官双向预约沟通 ----------------
+    addSlot(payload) {
+      return this.runBusy(`slot-add:${Date.now()}`, () =>
+        this.api('POST', '/schedule/slots', payload, { success: '可用时段已添加' }))
+    },
+    removeSlot(id) {
+      return this.runBusy(`slot-rm:${id}`, () =>
+        this.api('POST', `/schedule/slots/${id}/remove`, {}, { success: '时段已删除' }))
+    },
+    proposeAppointment(payload) {
+      return this.runBusy(`apt-new:${payload.application_id}`, () =>
+        this.api('POST', '/schedule/appointments', payload, { success: '面试预约已提议，等待对方确认' }))
+    },
+    ackAppointment(id, payload) {
+      return this.runBusy(`apt-ack:${id}`, () =>
+        this.api('POST', `/schedule/appointments/${id}/ack`, payload,
+          { success: payload.accept === false ? '已婉拒，可重新提议时间' : '已确认，等待对方确认' }))
+    },
+    rescheduleAppointment(id, payload) {
+      const msg = { request: '改期请求已发出', accept: '已同意改期，面试时间已更新', decline: '已拒绝改期，维持原约' }[payload.action] || '改期操作完成'
+      return this.runBusy(`apt-rs:${id}:${payload.action}`, () =>
+        this.api('POST', `/schedule/appointments/${id}/reschedule`, payload, { success: msg }))
+    },
+    cancelAppointment(id, note) {
+      return this.runBusy(`apt-cancel:${id}`, () =>
+        this.api('POST', `/schedule/appointments/${id}/cancel`, { note }, { success: '预约已取消' }))
+    },
+    markAttendance(id, result, note) {
+      const msg = {
+        attended: '已登记出席', candidate_noshow: '已登记候选人缺席，流程联动淘汰',
+        interviewer_noshow: '已登记面试官缺席，待重新安排'
+      }[result] || '出席情况已记录'
+      return this.runBusy(`apt-att:${id}`, () =>
+        this.api('POST', `/schedule/appointments/${id}/attendance`, { result, note }, { success: msg }))
+    }
   }
 })

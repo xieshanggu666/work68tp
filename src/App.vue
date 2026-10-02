@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 import { useHrStore } from '@/store/hr'
 import OverviewView from '@/components/OverviewView.vue'
 import PositionsView from '@/components/PositionsView.vue'
@@ -7,6 +7,7 @@ import CandidatesView from '@/components/CandidatesView.vue'
 import MatchView from '@/components/MatchView.vue'
 import PipelineView from '@/components/PipelineView.vue'
 import InterviewView from '@/components/InterviewView.vue'
+import ScheduleView from '@/components/ScheduleView.vue'
 import OfferView from '@/components/OfferView.vue'
 import ApprovalView from '@/components/ApprovalView.vue'
 import ReportsView from '@/components/ReportsView.vue'
@@ -23,6 +24,7 @@ const navs = [
   { k: 'match', icon: '🎯', label: '智能匹配' },
   { k: 'pipeline', icon: '🔄', label: '招聘流程' },
   { k: 'interview', icon: '💬', label: '面试管理' },
+  { k: 'schedule', icon: '🤝', label: '面试预约' },
   { k: 'offer', icon: '📄', label: 'Offer 管理' },
   { k: 'approval', icon: '✅', label: '审批中心' },
   { k: 'crisis', icon: '🛡️', label: '危机审计' },
@@ -30,9 +32,30 @@ const navs = [
 ]
 
 const roleIcon = { recruiter: '🧭', interviewer: '💬', hiring_manager: '🏢' }
+// 预约页导航红点：面试官看待本人 ack/改期回应；招聘负责人看待代候选人 ack/回应改期/超时登记
+const scheduleTodoCount = computed(() => {
+  const role = store.myRole
+  const myId = store.currentUser?.id
+  return store.appointments.filter(a => {
+    if (a.status === 'proposed') {
+      if (role === 'interviewer') return a.interviewer_user_id === myId && a.interviewer_ack === 'pending'
+      if (role === 'recruiter') return a.candidate_ack === 'pending'
+    }
+    if (a.status === 'reschedule_requested' && a.pending_reschedule) {
+      if (role === 'interviewer') return a.interviewer_user_id === myId && a.pending_reschedule.side === 'candidate'
+      if (role === 'recruiter') return a.pending_reschedule.side === 'interviewer'
+    }
+    return role === 'recruiter' && a.status === 'confirmed' && !!a.overdue_at
+  }).length
+})
 const notifyIcon = {
   task_submitted: '📨', task_approved: '✅', task_returned: '↩️', task_resubmitted: '🔁',
   task_executed: '🎉', task_failed: '⚠️', task_cancelled: '🚫',
+  schedule_proposed: '📨', schedule_candidate_pending: '📨', schedule_ack: '✅',
+  schedule_confirmed: '🎉', schedule_declined: '🙅', schedule_reschedule: '🔁',
+  schedule_reschedule_done: '📅', schedule_reschedule_rejected: '🚫',
+  schedule_cancelled: '❌', schedule_remind: '🔔', schedule_overdue: '⏰',
+  schedule_attended: '✅', schedule_noshow: '⚠️',
   crisis_declared: '🚨', crisis_state: '⚡', crisis_commander: '🔀',
   crisis_grant: '🔑', crisis_grant_log: '🔑', crisis_grant_revoked: '🔒',
   crisis_rollback: '⏪', crisis_ticket: '🎫', crisis_ticket_assign: '🎫', crisis_ticket_update: '🎫',
@@ -50,13 +73,17 @@ function toggleNotify() {
 function readAll() {
   store.markNotificationsRead()
 }
-// 点击通知跳转到对应中心并关闭面板：危机类 → 危机审计，其余 → 审批中心
+// 点击通知跳转到对应中心并关闭面板：危机类 → 危机审计，预约类 → 面试预约，其余 → 审批中心
 function openNotify(n) {
   showNotify.value = false
-  view.value = String(n?.type || '').startsWith('crisis_') ? 'crisis' : 'approval'
+  const t = String(n?.type || '')
+  view.value = t.startsWith('crisis_') ? 'crisis' : t.startsWith('schedule_') ? 'schedule' : 'approval'
 }
 
 onMounted(store.refresh)
+
+// 跨页面导航：其他组件（如面试管理）通过 store.goNav 切换侧边栏视图
+watch(() => store.nav, v => { if (v && v !== view.value) view.value = v })
 </script>
 
 <template>
@@ -70,6 +97,7 @@ onMounted(store.refresh)
           <button v-for="n in navs" :key="n.k" class="navitem" :class="{ on: view === n.k }" @click="view = n.k">
             <span>{{ n.icon }}</span>{{ n.label }}
             <em v-if="n.k === 'approval' && store.todoCount" class="nav-badge">{{ store.todoCount }}</em>
+            <em v-else-if="n.k === 'schedule' && scheduleTodoCount" class="nav-badge schedule-badge">{{ scheduleTodoCount }}</em>
             <em v-else-if="n.k === 'crisis' && store.crisisIncidents.filter(i => i.status !== 'closed').length" class="nav-badge crisis-badge">
               {{ store.crisisIncidents.filter(i => i.status !== 'closed').length }}
             </em>
@@ -130,6 +158,7 @@ onMounted(store.refresh)
         <MatchView v-else-if="view === 'match'" />
         <PipelineView v-else-if="view === 'pipeline'" />
         <InterviewView v-else-if="view === 'interview'" />
+        <ScheduleView v-else-if="view === 'schedule'" />
         <OfferView v-else-if="view === 'offer'" />
         <ApprovalView v-else-if="view === 'approval'" />
         <CrisisView v-else-if="view === 'crisis'" />
@@ -167,6 +196,7 @@ main { flex: 1; min-width: 0; }
 .pill b { color: var(--text); }
 .nav-badge { margin-left: auto; font-style: normal; font-size: 10px; min-width: 17px; height: 17px; border-radius: 9px; background: var(--red); color: #fff; display: inline-flex; align-items: center; justify-content: center; padding: 0 4px; }
 .nav-badge.crisis-badge { background: var(--purple); }
+.nav-badge.schedule-badge { background: var(--cyan); color: #06233a; }
 .idzone { display: flex; align-items: center; gap: 10px; }
 .idchip { display: flex; align-items: center; gap: 6px; background: var(--panel); border: 1px solid var(--border); border-radius: 20px; padding: 4px 6px 4px 12px; font-size: 13px; }
 .idchip select { border: none; background: transparent; padding: 3px 4px; font-size: 13px; }

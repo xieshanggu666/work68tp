@@ -3,6 +3,9 @@ import db, { ts, now, DEFAULT_WEIGHTS, DEFAULT_KEYWORD_CAP } from './db.js'
 import {
   router as crisisRouter, bindCrisisCore, auditPassive, getCrisisState
 } from './crisis.js'
+import {
+  router as scheduleRouter, bindScheduleCore, sweepReminders, getScheduleState
+} from './schedule.js'
 
 const app = express()
 app.use(express.json())
@@ -119,6 +122,29 @@ function checkVersion(app, expected) {
 
 function latestInterviewOf(applicationId) {
   return db.prepare('SELECT * FROM interviews WHERE application_id=? ORDER BY id DESC LIMIT 1').get(applicationId) || null
+}
+
+// 创建正式面试记录（「添加下一轮」与双向预约确认后共用，保证面试页与预约页口径一致）
+// 必须在调用方事务内执行；返回新面试 id
+function createInterview(applicationId, { interviewer = '', time = '', round = '初试', eval: evalText = '', result } = {}) {
+  const r = db.prepare('INSERT INTO interviews(application_id,interviewer,time,round,eval,result,conclusion) VALUES(?,?,?,?,?,?,\'pending\')')
+    .run(applicationId, interviewer, time || ts(), round, evalText || '',
+      result === 'pass' || result === 'fail' ? result : 'pending')
+  return Number(r.lastInsertRowid)
+}
+
+// 候选人面试缺席联动淘汰：复用与手动淘汰完全相同的状态机（写 reject 事件、撤回待回应 Offer、危机审计上链）
+function rejectForNoShow(a, { operator, reason }) {
+  const fromStage = a.stage
+  withdrawActiveOffer(a, { operator, reason, force: true })
+  moveStage(a, 'rejected', { eventType: 'reject', operator, fromStage })
+  db.prepare('UPDATE applications SET reject_from=? WHERE id=?').run(fromStage, a.id)
+  auditPassive({
+    category: 'action', action: 'state.reject', actor: { name: operator, role: 'recruiter' }, applicationId: a.id,
+    refType: 'appointment', refId: '',
+    summary: `候选人面试缺席联动淘汰：${STAGE_LABEL[fromStage] || fromStage} → 淘汰`,
+    detail: { from: fromStage, to: 'rejected', reason }
+  })
 }
 
 // 面试结论约束：进入 Offer 前，最近一轮必须已有「通过」结论（待定/不通过均拦截）
@@ -344,6 +370,8 @@ function buildSnapshot(candId, posId, m, extra = {}) {
 
 // ---------------- 状态汇总 ----------------
 app.get('/api/state', (req, res) => {
+  // 状态拉取即心跳：顺带扫描面试提醒（24h/2h）与超时未登记的确认预约，通知只追加不重复
+  try { sweepReminders() } catch (e) { console.error('[HR] schedule sweep failed:', e.message) }
   const positions = db.prepare('SELECT * FROM positions ORDER BY id').all().map(p => {
     const st = db.prepare('SELECT published_at, published_by FROM match_strategies WHERE position_id=?').get(p.id)
     return { ...p, skills: parseSkills(p.skills), strategy: st ? { published_at: st.published_at, published_by: st.published_by } : null }
@@ -450,7 +478,8 @@ app.get('/api/state', (req, res) => {
     positions, candidates, applications: pipelines, interviews, offers, offerLogs, channels, matches,
     strategyVersions, recalcJobs, recalcItems, users, approvals, notifications,
     defaultStrategy: { weights: { ...DEFAULT_WEIGHTS }, keywordCap: DEFAULT_KEYWORD_CAP },
-    ...getCrisisState()
+    ...getCrisisState(),
+    ...getScheduleState()
   })
 })
 
@@ -887,9 +916,11 @@ app.post('/api/applications/:id/interview', (req, res, next) => {
       const a = db.prepare('SELECT id,stage FROM applications WHERE id=?').get(appId)
       if (!a) return { notFound: true }
       if (a.stage === 'rejected' || a.stage === 'hired') conflict('该候选人流程已终态，不能再安排面试', 'terminal_locked')
-      const r = db.prepare('INSERT INTO interviews(application_id,interviewer,time,round,eval,result,conclusion) VALUES(?,?,?,?,?,?,\'pending\')')
-        .run(appId, b.interviewer || '面试官', b.time || ts(), b.round || '初试', b.eval || '', b.result === 'pass' || b.result === 'fail' ? b.result : 'pending')
-      return { ok: true, id: Number(r.lastInsertRowid) }
+      const id = createInterview(appId, {
+        interviewer: b.interviewer || '面试官', time: b.time || ts(),
+        round: b.round || '初试', eval: b.eval || '', result: b.result
+      })
+      return { ok: true, id }
     })
     if (out.notFound) return res.status(404).json({ ok: false, code: 'not_found' })
     res.json(out)
@@ -1497,6 +1528,10 @@ migrateHistory()
 // 挂载跨角色危机处置审计模块（路由 + 哈希链 + 责任回写），并注入主流程回退执行器
 bindCrisisCore({ rollbackForIncident })
 app.use('/api/crisis', crisisRouter)
+
+// 挂载候选人↔面试官双向预约沟通模块，并注入「创建面试记录 / 缺席联动淘汰」主流程能力
+bindScheduleCore({ createInterview, rejectForNoShow })
+app.use('/api/schedule', scheduleRouter)
 
 // 统一业务错误出口：ApiError 携带状态码与错误码，其余错误按 500 返回
 // eslint-disable-next-line no-unused-vars

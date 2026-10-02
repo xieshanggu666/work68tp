@@ -16,6 +16,7 @@ const list = computed(() => interviewApps.value.filter(a =>
 ))
 
 function openDetail(a) { detail.value = a }
+function goSchedule() { store.goNav('schedule') }
 
 const ivResult = r => ({
   pending: ['⏳', '待定'], pass: ['✅', '通过'], fail: ['❌', '不通过']
@@ -68,10 +69,13 @@ function passAndAdvance(a) {
   <div class="interview">
     <div class="bar">
       <span class="muted">面试相关应聘 {{ interviewApps.length }} 份（含最近一轮不通过待复核）</span>
-      <select v-model="roundFilter" class="round-filter">
-        <option value="all">全部轮次</option>
-        <option v-for="r in ['初试','复试','终面','HR面']" :key="r" :value="r">{{ r }}</option>
-      </select>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="ghost sm go-sched" @click="goSchedule">🤝 双向预约沟通（可用时段/确认/改期/提醒/缺席）</button>
+        <select v-model="roundFilter" class="round-filter">
+          <option value="all">全部轮次</option>
+          <option v-for="r in ['初试','复试','终面','HR面']" :key="r" :value="r">{{ r }}</option>
+        </select>
+      </div>
     </div>
 
     <div class="ilist">
@@ -174,5 +178,7 @@ function passAndAdvance(a) {
 .acts { display: flex; gap: 8px; flex-wrap: wrap; }
 .appr-pending { font-size: 11px; color: var(--accent2); background: rgba(255,209,102,.1); border: 1px solid rgba(255,209,102,.35); border-radius: 8px; padding: 5px 9px; margin-bottom: 8px; }
 .tip { margin-top: 10px; font-size: 12px; }
+.go-sched { font-size: 12px; }
+.go-sched:hover { border-color: var(--cyan); color: var(--cyan); }
 textarea { width: 100%; background: #101731; border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 8px; font-size: 13px; font-family: inherit; resize: vertical; }
 </style>

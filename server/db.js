@@ -355,6 +355,76 @@ CREATE TABLE IF NOT EXISTS crisis_reports (
   updated_at TEXT NOT NULL DEFAULT ''
 );
 
+-- ---------------- 候选人↔面试官双向预约沟通模块 ----------------
+-- 可用时段：候选人与面试官各自维护可约时间；预约确认后命中的时段置为 booked 并锁定到预约单
+CREATE TABLE IF NOT EXISTS schedule_slots (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  owner_type TEXT NOT NULL,              -- candidate/interviewer
+  candidate_id INTEGER NOT NULL DEFAULT 0,
+  user_id TEXT NOT NULL DEFAULT '',      -- owner_type=interviewer 时的面试官用户 id
+  date TEXT NOT NULL,                    -- YYYY-MM-DD
+  start_time TEXT NOT NULL,              -- HH:mm
+  end_time TEXT NOT NULL,                -- HH:mm
+  mode TEXT NOT NULL DEFAULT 'onsite',   -- onsite/video/phone 现场/视频/电话
+  status TEXT NOT NULL DEFAULT 'available', -- available/booked/blocked 可约/已锁定/不可用
+  booked_appointment_id INTEGER NOT NULL DEFAULT 0,
+  created TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_slots_owner ON schedule_slots(owner_type, user_id, candidate_id, date);
+CREATE INDEX IF NOT EXISTS idx_slots_booked ON schedule_slots(booked_appointment_id);
+
+-- 面试预约单：提议 → 双方确认 → （改期协商）→ 出席/缺席；消息表保存完整协商过程
+CREATE TABLE IF NOT EXISTS appointments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  application_id INTEGER NOT NULL,
+  interview_id INTEGER NOT NULL DEFAULT 0,   -- 双方确认后生成/关联的正式面试记录
+  interviewer_user_id TEXT NOT NULL DEFAULT '',
+  interviewer_name TEXT NOT NULL DEFAULT '',
+  round TEXT NOT NULL DEFAULT '初试',
+  proposed_by TEXT NOT NULL DEFAULT '',      -- 提议人用户 id
+  proposed_by_name TEXT NOT NULL DEFAULT '',
+  start_at TEXT NOT NULL DEFAULT '',         -- 当前生效时间（改期确认前仍为原约定时间）
+  end_at TEXT NOT NULL DEFAULT '',
+  duration_min INTEGER NOT NULL DEFAULT 60,
+  location TEXT NOT NULL DEFAULT '',         -- 会议链接/面试间
+  mode TEXT NOT NULL DEFAULT 'onsite',
+  status TEXT NOT NULL DEFAULT 'proposed',
+  -- proposed 待双方确认 / confirmed 已确认 / reschedule_requested 改期协商中
+  -- / declined 婉待重新提议 / cancelled 已取消 / completed 已出席
+  -- / candidate_noshow 候选人缺席 / interviewer_noshow 面试官缺席
+  candidate_ack TEXT NOT NULL DEFAULT 'pending',    -- pending/accepted/declined
+  interviewer_ack TEXT NOT NULL DEFAULT 'pending',
+  candidate_ack_at TEXT NOT NULL DEFAULT '',
+  interviewer_ack_at TEXT NOT NULL DEFAULT '',
+  reschedule_count INTEGER NOT NULL DEFAULT 0,
+  attend_marked_by TEXT NOT NULL DEFAULT '',
+  attend_marked_at TEXT NOT NULL DEFAULT '',
+  remind_24_at TEXT NOT NULL DEFAULT '',      -- 24 小时提醒已发（只发一次）
+  remind_2h_at TEXT NOT NULL DEFAULT '',      -- 2 小时提醒已发
+  overdue_at TEXT NOT NULL DEFAULT '',        -- 已过结束时间仍未记录出席/缺席
+  version INTEGER NOT NULL DEFAULT 1,
+  created TEXT NOT NULL,
+  updated TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_appointments_app ON appointments(application_id, id);
+CREATE INDEX IF NOT EXISTS idx_appointments_interviewer ON appointments(interviewer_user_id, status);
+CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status, start_at);
+
+-- 预约沟通消息（只追加）：提议/接受/婉拒/改期请求/同意改期/拒绝改期/确认/取消/提醒/出席/缺席
+CREATE TABLE IF NOT EXISTS appointment_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  appointment_id INTEGER NOT NULL,
+  sender_type TEXT NOT NULL DEFAULT 'system', -- recruiter/interviewer/candidate/system
+  sender_id TEXT NOT NULL DEFAULT '',
+  sender_name TEXT NOT NULL DEFAULT '',
+  kind TEXT NOT NULL,                         -- propose/accept/decline/reschedule_request/reschedule_accept/reschedule_decline/confirm/cancel/remind/attend/noshow
+  side TEXT NOT NULL DEFAULT '',              -- candidate/interviewer 动作来源侧
+  content TEXT NOT NULL DEFAULT '',
+  payload TEXT NOT NULL DEFAULT '{}',         -- 改期请求携带的新时间/方式等
+  created TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_appt_messages_appt ON appointment_messages(appointment_id, id);
+
 -- 不可篡改兜底：危机审计链拒绝 UPDATE / DELETE（应用层哈希校验 + 数据库触发器双重保护）
 CREATE TRIGGER IF NOT EXISTS trg_crisis_entries_no_update
 BEFORE UPDATE ON crisis_audit_entries
@@ -395,6 +465,18 @@ addColumn('notifications', 'incident_id', `INTEGER NOT NULL DEFAULT 0`)
 addColumn('notifications', 'ticket_id', `INTEGER NOT NULL DEFAULT 0`)
 addColumn('notifications', 'owner_name', `TEXT NOT NULL DEFAULT ''`)
 addColumn('notifications', 'owner_user_id', `TEXT NOT NULL DEFAULT ''`)
+
+// 双向预约沟通模块：预约单状态机与提醒/缺席标记列（旧库升级；新表建表即含）
+;['interview_id', 'remind_24_at', 'remind_2h_at', 'overdue_at', 'attend_marked_by', 'attend_marked_at',
+  'candidate_ack', 'interviewer_ack', 'candidate_ack_at', 'interviewer_ack_at', 'reschedule_count', 'version'
+].forEach(col => addColumn('appointments', col, ({
+  interview_id: `INTEGER NOT NULL DEFAULT 0`,
+  remind_24_at: `TEXT NOT NULL DEFAULT ''`, remind_2h_at: `TEXT NOT NULL DEFAULT ''`, overdue_at: `TEXT NOT NULL DEFAULT ''`,
+  attend_marked_by: `TEXT NOT NULL DEFAULT ''`, attend_marked_at: `TEXT NOT NULL DEFAULT ''`,
+  candidate_ack: `TEXT NOT NULL DEFAULT 'pending'`, interviewer_ack: `TEXT NOT NULL DEFAULT 'pending'`,
+  candidate_ack_at: `TEXT NOT NULL DEFAULT ''`, interviewer_ack_at: `TEXT NOT NULL DEFAULT ''`,
+  reschedule_count: `INTEGER NOT NULL DEFAULT 0`, version: `INTEGER NOT NULL DEFAULT 1`
+})[col]))
 
 // 旧库索引迁移：正式事件改为「每个 application×stage 仅保留最新一条」（部分唯一索引）
 const evIndexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='application_events'").all().map(i => i.name)
@@ -492,6 +574,45 @@ function seedUsers() {
   ].forEach(u => iU.run(...u))
 }
 seedUsers()
+
+// 双向预约演示数据：为面试官与前几位候选人生成未来一周的可用时段（刻意保留交集，便于直接发起预约）
+function seedAvailability() {
+  const n = db.prepare('SELECT COUNT(*) c FROM schedule_slots').get().c
+  if (n > 0) return
+  const iv = db.prepare("SELECT id FROM users WHERE role='interviewer' ORDER BY id LIMIT 1").get()
+  if (!iv) return
+  const candIds = db.prepare('SELECT id FROM candidates ORDER BY id LIMIT 6').all().map(c => c.id)
+  const today = new Date()
+  const d = offset => {
+    const x = new Date(today); x.setDate(x.getDate() + offset)
+    return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`
+  }
+  const ins = db.prepare(`INSERT INTO schedule_slots(owner_type,candidate_id,user_id,date,start_time,end_time,mode,status,created)
+                          VALUES(?,?,?,?,?,?,?, 'available', ?)`)
+  // 面试官：未来 5 个工作日各两段（现场/视频交替）
+  const ivPlan = [
+    [1, '10:00', '12:00', 'onsite'], [1, '14:00', '17:00', 'video'],
+    [2, '09:30', '11:30', 'video'], [2, '14:00', '16:00', 'onsite'],
+    [3, '10:00', '12:00', 'onsite'],
+    [4, '13:30', '15:30', 'video'], [4, '16:00', '18:00', 'onsite'],
+    [5, '09:00', '11:00', 'onsite']
+  ]
+  ivPlan.forEach(([off, st, et, mode]) => ins.run('interviewer', 0, iv.id, d(off), st, et, mode, ts()))
+  // 候选人：与面试官时段有交集，也有仅个人可约的时段（演示交集推荐）
+  const candPlan = {
+    1: [[1, '09:00', '11:00', 'onsite'], [2, '14:30', '18:00', 'onsite'], [4, '13:00', '15:00', 'video']],
+    2: [[1, '11:00', '13:00', 'onsite'], [3, '09:00', '12:30', 'onsite']],
+    3: [[2, '10:00', '12:00', 'video'], [5, '08:30', '10:00', 'onsite']],
+    4: [[4, '14:00', '17:00', 'onsite'], [6, '10:00', '12:00', 'onsite']],
+    5: [[1, '15:00', '18:00', 'video'], [7, '11:00', '13:00', 'video']],
+    6: [[2, '15:00', '17:00', 'onsite'], [4, '15:30', '18:30', 'onsite']]
+  }
+  candIds.forEach((cid, idx) => {
+    ;(candPlan[idx + 1] || []).forEach(([off, st, et, mode]) =>
+      ins.run('candidate', cid, '', d(off), st, et, mode, ts()))
+  })
+}
+seedAvailability()
 
 export default db
 export { now, ts, DEFAULT_WEIGHTS, DEFAULT_KEYWORD_CAP }

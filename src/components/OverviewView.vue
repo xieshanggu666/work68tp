@@ -52,6 +52,19 @@ const channelCount = computed(() => {
   store.candidates.forEach(c => { m[c.channel] = (m[c.channel] || 0) + 1 })
   return Object.entries(m).sort((a, b) => b[1] - a[1])
 })
+
+// 双向预约摘要：今日已确认 / 待双向确认 / 改期协商中 / 超时待登记
+const today = new Date().toISOString().slice(0, 10)
+const apptSummary = computed(() => {
+  const list = store.appointments
+  return {
+    today: list.filter(a => a.status === 'confirmed' && (a.start_at || '').slice(0, 10) === today).length,
+    proposed: list.filter(a => a.status === 'proposed').length,
+    reschedule: list.filter(a => a.status === 'reschedule_requested').length,
+    overdue: list.filter(a => a.status === 'confirmed' && a.overdue_at).length
+  }
+})
+function goSchedule() { store.goNav('schedule') }
 </script>
 
 <template>
@@ -64,6 +77,25 @@ const channelCount = computed(() => {
       <div class="card stat"><span>🎉</span><b class="money">{{ joinedCount }}</b><em>已入职</em></div>
       <div class="card stat"><span>⏱️</span><b>{{ Math.max(1, store.applications.filter(a => !['hired','rejected'].includes(a.stage)).length) }}</b><em>流程在途</em></div>
       <div class="card stat"><span>📄</span><b>{{ pendingOffer }}</b><em>待回应 Offer</em></div>
+    </div>
+
+    <div class="card appt-banner" @click="goSchedule">
+      <h3>🤝 候选人 ↔ 面试官双向预约</h3>
+      <div class="appt-items">
+        <div class="ai" :class="{ hot: apptSummary.today }">
+          <b>{{ apptSummary.today }}</b><span>今日已确认面试</span>
+        </div>
+        <div class="ai" :class="{ hot: apptSummary.proposed }">
+          <b>{{ apptSummary.proposed }}</b><span>待双向确认</span>
+        </div>
+        <div class="ai" :class="{ hot: apptSummary.reschedule }">
+          <b>{{ apptSummary.reschedule }}</b><span>改期协商中</span>
+        </div>
+        <div class="ai" :class="{ hot: apptSummary.overdue }">
+          <b class="danger">{{ apptSummary.overdue }}</b><span>超时待登记出席</span>
+        </div>
+        <button class="ghost">进入预约沟通 →</button>
+      </div>
     </div>
 
     <div class="row">
@@ -135,4 +167,15 @@ const channelCount = computed(() => {
 .chan-list .no { width: 20px; height: 20px; background: var(--panel2); display: inline-flex; align-items: center; justify-content: center; border-radius: 6px; font-size: 11px; color: var(--muted); }
 .cbar { flex: 1; height: 10px; background: var(--panel2); border-radius: 5px; overflow: hidden; }
 .cbar i { display: block; height: 100%; }
+
+.appt-banner { cursor: pointer; transition: .18s; }
+.appt-banner:hover { border-color: var(--cyan); }
+.appt-items { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+.ai { display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 110px; padding: 8px 12px; border-radius: 10px; background: var(--panel2); border: 1px solid var(--border); }
+.ai b { font-size: 22px; color: var(--text); }
+.ai span { font-size: 11px; color: var(--muted); }
+.ai.hot { border-color: rgba(79,195,247,.5); box-shadow: 0 0 0 1px rgba(79,195,247,.2); }
+.ai.hot b { color: var(--cyan); }
+.ai b.danger { color: var(--red); }
+.appt-items button { margin-left: auto; }
 </style>
